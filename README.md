@@ -29,8 +29,16 @@ AC/DC peak prominence and interval checks reject low-quality signals, baseline
 drift, and placement changes.
 The measurement screen displays a filtered waveform, signal quality, and a
 10-second progress indicator. The indicator reaches 100% after ten seconds but
-does not automatically stop the scan; three consecutive uncovered frames start
-a 300 ms removal confirmation before ending the session.
+does not automatically stop the scan. A center target on the live preview
+indicates the camera/flashlight placement area; the user must cover both the
+rear camera lens and torch. Three consecutive uncovered frames start a 300 ms
+removal confirmation, after which the camera stops and a frozen Scan Complete
+summary displays the final BPM, signal quality, duration, and sample count.
+Tapping Finish also opens this summary; only Done returns to the home screen.
+If no valid coverage is achieved within 20 seconds of opening the measurement
+screen, the torch and camera stream stop and the app returns home with a timeout
+notice. Poor or acquiring signal lasting five seconds shows gentle placement
+and warming guidance.
 Each session appends accepted raw green-channel samples and logger diagnostics to
 `data/heart_rate_samples.csv` under the app's writable storage directory (the
 application documents directory on Android/iOS, or the executable directory
@@ -271,14 +279,24 @@ Launch app
                         |   -> Filter green sample; update BPM, quality,
                         |      progress and waveform; append raw sample and
                         |      logger diagnostics to CSV
+                        |      Cancel the 20-second no-coverage timeout
                         +-- Active coverage has fewer than 3 consecutive
                         |   failed frames or has failed for less than 300 ms
                         |   -> Remain ACTIVE; preserve history and progress
                         +-- Presence becomes/remains RELEASED
-                            -> Clear home BPM; wait 600 ms; close screen
+                            -> Freeze final BPM/quality/duration/sample count
+                               Stop stream and torch; show Scan Complete screen
+                               Keep the result visible until user taps Done
+                        +-- Finish tapped during scan
+                            -> Freeze current stats and show Scan Complete
+                        +-- 20 seconds elapse without ACTIVE coverage
+                            -> Stop stream and torch; return home
+                               Show inactivity-timeout notification
+                        +-- POOR or ACQUIRING persists for 5 seconds
+                            -> Show signal-specific placement/warming guidance
         |
-        +-- User taps close at any time
-            -> Close measurement screen
+        +-- User taps Done on Scan Complete
+            -> Close measurement screen and return home
         |
         +-- Measurement screen closes
             -> Stop image stream, turn torch off, dispose camera,

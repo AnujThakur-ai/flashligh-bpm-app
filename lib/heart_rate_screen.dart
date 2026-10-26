@@ -9,22 +9,26 @@ import 'camera_service.dart';
 import 'optical_presence_gate.dart';
 import 'ppg_processor.dart';
 
+enum MeasurementExitReason { inactivityTimeout }
+
 class HeartRateScreen extends StatefulWidget {
   const HeartRateScreen({
     required this.onSample,
     required this.onBpm,
+    this.cameraService,
     super.key,
   });
 
   final ValueChanged<SensorValue> onSample;
   final ValueChanged<int?> onBpm;
+  final CameraService? cameraService;
 
   @override
   State<HeartRateScreen> createState() => _HeartRateScreenState();
 }
 
 class _HeartRateScreenState extends State<HeartRateScreen> {
-  final CameraService _cameraService = CameraService();
+  late final CameraService _cameraService;
   final PpgProcessor _processor = PpgProcessor();
   final List<double> _waveform = [];
   PresenceState _presence = PresenceState.idle;
@@ -33,26 +37,92 @@ class _HeartRateScreenState extends State<HeartRateScreen> {
   int? _bpm;
   double _progress = 0;
   int _frameNumber = 0;
+  int _sampleCount = 0;
   bool _processingFrame = false;
-  Timer? _releaseTimer;
+  bool _summaryShown = false;
+  bool _isClosing = false;
+  bool _hasReachedActive = false;
+  DateTime? _scanStartedAt;
+  DateTime? _weakSignalStartedAt;
+  Duration _finalDuration = Duration.zero;
+  Timer? _inactivityTimer;
+  Future<void>? _cameraStopFuture;
+  late final Future<void> _cameraStartFuture;
 
   @override
   void initState() {
     super.initState();
-    unawaited(_startCamera());
+    _cameraService = widget.cameraService ?? CameraService();
+    _scanStartedAt = DateTime.now();
+    _inactivityTimer = Timer(const Duration(seconds: 20), _checkInactivity);
+    _cameraStartFuture = _startCamera();
   }
 
   @override
   void dispose() {
-    _releaseTimer?.cancel();
-    unawaited(_cameraService.dispose());
+    _inactivityTimer?.cancel();
+    unawaited(
+      _stopCamera().catchError((Object error, StackTrace stackTrace) {
+        debugPrint('Unable to stop camera while closing scan: '
+            '$error\n$stackTrace');
+      }),
+    );
     super.dispose();
+  }
+
+  void _checkInactivity() {
+    if (!mounted || _hasReachedActive || _isClosing || _error != null) return;
+    if (_presence != PresenceState.idle &&
+        _presence != PresenceState.detecting) {
+      return;
+    }
+    _isClosing = true;
+    unawaited(_returnAfterInactivityTimeout());
+  }
+
+  Future<void> _returnAfterInactivityTimeout() async {
+    try {
+      await _stopCamera();
+    } on Object catch (error, stackTrace) {
+      debugPrint('Unable to stop camera after inactivity timeout: '
+          '$error\n$stackTrace');
+    }
+    if (!mounted) return;
+    Navigator.of(context).pop(MeasurementExitReason.inactivityTimeout);
+  }
+
+  Future<void> _completeScan() async {
+    if (!mounted || _summaryShown || _isClosing) return;
+    _inactivityTimer?.cancel();
+    _finalDuration = DateTime.now().difference(_scanStartedAt!);
+    setState(() {
+      _summaryShown = true;
+    });
+    try {
+      await _stopCamera();
+    } on Object catch (error, stackTrace) {
+      debugPrint('Unable to stop camera after scan completion: '
+          '$error\n$stackTrace');
+    }
+  }
+
+  Future<void> _stopCamera() => _cameraStopFuture ??= _stopCameraAfterStart();
+
+  Future<void> _stopCameraAfterStart() async {
+    await _cameraStartFuture;
+    await _cameraService.dispose();
+  }
+
+  void _finishAndReturnHome() {
+    if (_isClosing) return;
+    _isClosing = true;
+    Navigator.of(context).pop();
   }
 
   Future<void> _startCamera() async {
     try {
       await _cameraService.start(_processFrame);
-      if (mounted) setState(() {});
+      if (mounted && !_summaryShown && !_isClosing) setState(() {});
     } on Object catch (error, stackTrace) {
       debugPrint('Unable to start the PPG camera: $error\n$stackTrace');
       if (!mounted) return;
@@ -63,36 +133,57 @@ class _HeartRateScreenState extends State<HeartRateScreen> {
   }
 
   void _processFrame(CameraImage image) {
-    if (_processingFrame || !mounted || _error != null) return;
+    if (_processingFrame ||
+        !mounted ||
+        _error != null ||
+        _summaryShown ||
+        _isClosing) {
+      return;
+    }
     _processingFrame = true;
     try {
       final update = _processor.addFrame(image, DateTime.now());
       final presenceChanged = update.presence != _presence;
       _presence = update.presence;
-      _quality = update.signalQuality;
-      _progress = update.progress;
-      _bpm = update.bpm;
 
       if (update.presence == PresenceState.active) {
+        if (!_hasReachedActive) {
+          _hasReachedActive = true;
+          _inactivityTimer?.cancel();
+        }
+        _quality = update.signalQuality;
+        _progress = update.progress;
+        _bpm = update.bpm;
+        _sampleCount++;
+        if (_quality == PpgSignalQuality.poor ||
+            _quality == PpgSignalQuality.acquiring) {
+          _weakSignalStartedAt ??= DateTime.now();
+        } else {
+          _weakSignalStartedAt = null;
+        }
         widget.onSample(
           SensorValue(time: DateTime.now(), value: update.green),
         );
         widget.onBpm(update.bpm);
-      } else if (update.presence == PresenceState.released) {
-        widget.onBpm(null);
+      } else if (update.presence != PresenceState.released) {
+        _quality = update.signalQuality;
+        _progress = update.progress;
+        _bpm = null;
+        _weakSignalStartedAt = null;
       }
 
-      _waveform
-        ..add(update.filtered)
-        ..removeRange(0, _waveform.length > 300 ? _waveform.length - 300 : 0);
-
-      if (update.presence == PresenceState.released) {
-        _releaseTimer ??= Timer(const Duration(milliseconds: 600), () {
-          if (mounted) Navigator.of(context).pop();
-        });
+      if (update.presence == PresenceState.active) {
+        _waveform
+          ..add(update.filtered)
+          ..removeRange(
+            0,
+            _waveform.length > 300 ? _waveform.length - 300 : 0,
+          );
+      } else if (update.presence == PresenceState.released) {
+        unawaited(_completeScan());
       }
       _frameNumber++;
-      if (presenceChanged || _frameNumber % 3 == 0) {
+      if (!_summaryShown && (presenceChanged || _frameNumber % 3 == 0)) {
         setState(() {});
       }
     } on Object catch (error, stackTrace) {
@@ -125,8 +216,25 @@ class _HeartRateScreenState extends State<HeartRateScreen> {
         }
         return 'Pulse detected. Keep your finger steady.';
       case PresenceState.released:
-        return 'Finger removed. Ending measurement.';
+        return 'Finger removed. Preparing your summary.';
     }
+  }
+
+  String? get _signalGuidance {
+    final weakSince = _weakSignalStartedAt;
+    if (weakSince == null ||
+        DateTime.now().difference(weakSince) < const Duration(seconds: 5)) {
+      return null;
+    }
+    if (_quality == PpgSignalQuality.poor) {
+      return 'If your fingers feel cold, warm your hands and try again. '
+          'You can also adjust your fingertip pressure slightly.';
+    }
+    if (_quality == PpgSignalQuality.acquiring) {
+      return 'Keep your finger still and fully cover both the camera lens '
+          'and flashlight. Try adjusting pressure slightly.';
+    }
+    return null;
   }
 
   String get _qualityLabel {
@@ -160,15 +268,16 @@ class _HeartRateScreenState extends State<HeartRateScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    if (_summaryShown) return _buildSummary(theme);
+
     final controller = _cameraService.controller;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Heart-rate measurement'),
         actions: [
-          IconButton(
-            tooltip: 'Stop measurement',
-            onPressed: () => Navigator.of(context).pop(),
-            icon: const Icon(Icons.close),
+          TextButton(
+            onPressed: _completeScan,
+            child: const Text('Finish'),
           ),
         ],
       ),
@@ -198,6 +307,7 @@ class _HeartRateScreenState extends State<HeartRateScreen> {
                               ),
                             ),
                     ),
+                  if (_error == null) const Center(child: _LensTargetOverlay()),
                   Positioned(
                     top: 16,
                     left: 16,
@@ -244,6 +354,17 @@ class _HeartRateScreenState extends State<HeartRateScreen> {
               child: Column(
                 children: [
                   Text(_statusText, textAlign: TextAlign.center),
+                  if (_signalGuidance case final guidance?) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      guidance,
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: theme.colorScheme.tertiary,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
                   if (_error?.contains('Settings') ?? false) ...[
                     const SizedBox(height: 8),
                     TextButton(
@@ -279,6 +400,16 @@ class _HeartRateScreenState extends State<HeartRateScreen> {
                 ],
               ),
             ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+              child: SizedBox(
+                width: double.infinity,
+                child: OutlinedButton(
+                  onPressed: _completeScan,
+                  child: const Text('Finish scan'),
+                ),
+              ),
+            ),
             Expanded(
               flex: 2,
               child: Padding(
@@ -305,6 +436,143 @@ class _HeartRateScreenState extends State<HeartRateScreen> {
       ),
     );
   }
+
+  Widget _buildSummary(ThemeData theme) {
+    final bpm = _bpm;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Scan Complete'),
+        automaticallyImplyLeading: false,
+      ),
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.check_circle_outline,
+                  size: 64,
+                  color: theme.colorScheme.primary,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  bpm?.toString() ?? '--',
+                  style: theme.textTheme.displayLarge?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                Text('BPM', style: theme.textTheme.titleMedium),
+                const SizedBox(height: 8),
+                Text(
+                  bpm == null
+                      ? 'No reliable heart-rate estimate was captured.'
+                      : 'Your final heart-rate estimate',
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 28),
+                Card(
+                  child: Column(
+                    children: [
+                      _SummaryStat(
+                        label: 'Signal quality',
+                        value: _qualityLabel,
+                      ),
+                      const Divider(height: 1),
+                      _SummaryStat(
+                        label: 'Scan duration',
+                        value: '${_finalDuration.inSeconds} seconds',
+                      ),
+                      const Divider(height: 1),
+                      _SummaryStat(
+                        label: 'Samples collected',
+                        value: '$_sampleCount',
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 20),
+                Text(
+                  'This camera-based estimate is not a medical diagnosis.',
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 24),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: _finishAndReturnHome,
+                    child: const Text('Done'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LensTargetOverlay extends StatelessWidget {
+  const _LensTargetOverlay();
+
+  @override
+  Widget build(BuildContext context) => IgnorePointer(
+        child: Container(
+          width: 240,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.68),
+            border: Border.all(color: Colors.white, width: 2),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: const Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.camera_alt, color: Colors.white),
+                  SizedBox(width: 12),
+                  Icon(Icons.flash_on, color: Colors.amber),
+                ],
+              ),
+              SizedBox(height: 8),
+              Text(
+                'Place fingertip over the rear camera lens and flashlight',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+}
+
+class _SummaryStat extends StatelessWidget {
+  const _SummaryStat({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(label),
+            Text(value, style: const TextStyle(fontWeight: FontWeight.w600)),
+          ],
+        ),
+      );
 }
 
 class _WaveformPainter extends CustomPainter {

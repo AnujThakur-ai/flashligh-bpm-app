@@ -95,8 +95,8 @@ class _PulseHomePageState extends State<PulseHomePage>
       _csvPath = logger.filePath;
     });
     int? sessionBpm;
-    await Navigator.of(context).push<void>(
-      MaterialPageRoute<void>(
+    final exitReason = await Navigator.of(context).push<MeasurementExitReason>(
+      MaterialPageRoute<MeasurementExitReason>(
         builder: (routeContext) => HeartRateScreen(
           onSample: (value) {
             unawaited(
@@ -126,6 +126,15 @@ class _PulseHomePageState extends State<PulseHomePage>
     setState(() {
       _isMeasuring = false;
     });
+    if (exitReason == MeasurementExitReason.inactivityTimeout) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'No finger was detected within 20 seconds. The torch was turned off.',
+          ),
+        ),
+      );
+    }
   }
 
   void _reportLoggingError(Object error, StackTrace stackTrace) {
