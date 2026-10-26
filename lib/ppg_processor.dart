@@ -28,8 +28,13 @@ class PpgUpdate {
 
 class PpgProcessor {
   static const _historyDuration = Duration(seconds: 15);
+  static const _sampleRateHz = 30;
+  static const _samplePeriodSeconds = 1 / _sampleRateHz;
   static const _baselineCutoffHz = 0.75;
   static const _smoothingCutoffHz = 3.5;
+  static const _minimumAcDcRatio = 0.001;
+  static const _fairAcDcRatio = 0.002;
+  static const _goodAcDcRatio = 0.01;
   static const _minimumPeakDistance = Duration(milliseconds: 285);
   static const _maximumPeakDistance = Duration(milliseconds: 1350);
   static const _requiredIntervals = 3;
@@ -39,10 +44,12 @@ class PpgProcessor {
   final Queue<Duration> _intervals = Queue<Duration>();
 
   DateTime? _activeStartedAt;
-  DateTime? _lastTimestamp;
   DateTime? _lastPositivePeak;
   DateTime? _lastNegativePeak;
-  double? _previousRaw;
+  _RawGreenSample? _lastRawSample;
+  DateTime? _gridStartTimestamp;
+  int _nextGridIndex = 1;
+  double? _previousGridRaw;
   double _highPass = 0;
   double _lowPass = 0;
   int? _bpm;
@@ -77,8 +84,33 @@ class PpgProcessor {
 
   PpgUpdate addGreenSample(double green, DateTime timestamp) {
     _activeStartedAt ??= timestamp;
-    final filtered = _filter(green, timestamp);
-    final bpm = _detectPulsePeak(filtered);
+    final previous = _lastRawSample;
+    var bpm = _bpm;
+    if (previous == null) {
+      _gridStartTimestamp = timestamp;
+      _filterAtGrid(green, timestamp);
+    } else {
+      if (!timestamp.isAfter(previous.timestamp)) {
+        throw ArgumentError.value(
+          timestamp,
+          'timestamp',
+          'Sample timestamps must be strictly increasing.',
+        );
+      }
+      while (true) {
+        final gridTimestamp = _gridTimestamp(_nextGridIndex);
+        if (gridTimestamp.isAfter(timestamp)) break;
+        final fraction =
+            gridTimestamp.difference(previous.timestamp).inMicroseconds /
+                timestamp.difference(previous.timestamp).inMicroseconds;
+        final interpolated =
+            previous.value + (green - previous.value) * fraction;
+        _filterAtGrid(interpolated, gridTimestamp);
+        bpm = _detectPulsePeak() ?? bpm;
+        _nextGridIndex++;
+      }
+    }
+    _lastRawSample = _RawGreenSample(timestamp, green);
     final progress = timestamp.difference(_activeStartedAt!).inMilliseconds /
         const Duration(seconds: 10).inMilliseconds;
 
@@ -87,7 +119,7 @@ class PpgProcessor {
       signalQuality: _quality,
       progress: progress.clamp(0.0, 1.0),
       green: green,
-      filtered: filtered,
+      filtered: _history.isEmpty ? 0 : _history.last.filtered,
       bpm: bpm ?? _bpm,
     );
   }
@@ -95,44 +127,49 @@ class PpgProcessor {
   PpgSignalQuality get _quality {
     if (_history.length < 30) return PpgSignalQuality.acquiring;
     final recent = _history.toList().reversed.take(90).toList();
-    final values = recent.map((sample) => sample.filtered);
-    final minimum = values.reduce(math.min);
-    final maximum = values.reduce(math.max);
-    final amplitude = maximum - minimum;
-    if (amplitude < 0.08) return PpgSignalQuality.poor;
+    final dc = recent.map((sample) => sample.raw).reduce((a, b) => a + b) /
+        recent.length;
+    if (dc <= 0) return PpgSignalQuality.poor;
+    final minimum = recent.map((sample) => sample.filtered).reduce(math.min);
+    final maximum = recent.map((sample) => sample.filtered).reduce(math.max);
+    final acDcRatio = (maximum - minimum) / dc;
+    if (acDcRatio < _fairAcDcRatio) return PpgSignalQuality.poor;
     if (_intervals.length >= _requiredIntervals && _rejectedIntervals == 0) {
-      return PpgSignalQuality.good;
+      return acDcRatio >= _goodAcDcRatio
+          ? PpgSignalQuality.good
+          : PpgSignalQuality.fair;
     }
-    return amplitude > 0.3 ? PpgSignalQuality.fair : PpgSignalQuality.poor;
+    return PpgSignalQuality.fair;
   }
 
-  double _filter(double value, DateTime timestamp) {
-    final previousTimestamp = _lastTimestamp;
-    final dt = previousTimestamp == null
-        ? 1 / 30
-        : (timestamp.difference(previousTimestamp).inMicroseconds /
-                Duration.microsecondsPerSecond)
-            .clamp(1 / 120, 1 / 5);
-    final previousRaw = _previousRaw ?? value;
+  DateTime _gridTimestamp(int index) {
+    final offsetMicroseconds =
+        (index * Duration.microsecondsPerSecond / _sampleRateHz).round();
+    return _gridStartTimestamp!.add(
+      Duration(microseconds: offsetMicroseconds),
+    );
+  }
+
+  void _filterAtGrid(double value, DateTime timestamp) {
+    final previousRaw = _previousGridRaw ?? value;
     final highPassRc = 1 / (2 * math.pi * _baselineCutoffHz);
-    final highPassAlpha = highPassRc / (highPassRc + dt);
+    final highPassAlpha = highPassRc / (highPassRc + _samplePeriodSeconds);
     _highPass = highPassAlpha * (_highPass + value - previousRaw);
 
     final lowPassRc = 1 / (2 * math.pi * _smoothingCutoffHz);
-    final lowPassAlpha = dt / (lowPassRc + dt);
+    final lowPassAlpha =
+        _samplePeriodSeconds / (lowPassRc + _samplePeriodSeconds);
     _lowPass += lowPassAlpha * (_highPass - _lowPass);
-    _lastTimestamp = timestamp;
-    _previousRaw = value;
+    _previousGridRaw = value;
 
     _history.addLast(_SignalSample(timestamp, value, _lowPass));
     final cutoff = timestamp.subtract(_historyDuration);
     while (_history.isNotEmpty && _history.first.timestamp.isBefore(cutoff)) {
       _history.removeFirst();
     }
-    return _lowPass;
   }
 
-  int? _detectPulsePeak(double filtered) {
+  int? _detectPulsePeak() {
     if (_history.length < 3) return null;
     final samples = _history.toList();
     final prior = samples[samples.length - 3];
@@ -146,18 +183,25 @@ class PpgProcessor {
 
     final prominenceStart =
         peak.timestamp.subtract(const Duration(milliseconds: 500));
-    final local = samples
+    final localSamples = samples
         .where((sample) => !sample.timestamp.isBefore(prominenceStart))
-        .map((sample) => sample.filtered)
         .toList();
-    if (local.length < 3) return null;
+    if (localSamples.length < 3) return null;
+    final local = localSamples.map((sample) => sample.filtered).toList();
     final localMin = local.reduce(math.min);
     final localMax = local.reduce(math.max);
     final prominence =
         isMaximum ? peak.filtered - localMin : localMax - peak.filtered;
     final signalRange = localMax - localMin;
-    final minimumProminence = math.max(0.08, signalRange * 0.18);
-    if (prominence < minimumProminence) return null;
+    final localDc = localSamples
+            .map((sample) => sample.raw)
+            .reduce((left, right) => left + right) /
+        localSamples.length;
+    if (localDc <= 0) return null;
+    final prominenceRatio = prominence / localDc;
+    final minimumProminenceRatio =
+        math.max(_minimumAcDcRatio, signalRange / localDc * 0.18);
+    if (prominenceRatio < minimumProminenceRatio) return null;
 
     final previousPeak = isMaximum ? _lastPositivePeak : _lastNegativePeak;
     if (isMaximum) {
@@ -176,7 +220,14 @@ class PpgProcessor {
       return null;
     }
 
-    if (_intervals.isNotEmpty) {
+    if (_intervals.length == 1) {
+      final firstInterval = _intervals.first.inMicroseconds;
+      if ((interval.inMicroseconds - firstInterval).abs() / firstInterval >
+          0.35) {
+        _rejectedIntervals++;
+        return null;
+      }
+    } else if (_intervals.length >= _requiredIntervals) {
       final sorted = _intervals.map((item) => item.inMicroseconds).toList()
         ..sort();
       final medianInterval = sorted[sorted.length ~/ 2];
@@ -281,8 +332,10 @@ class PpgProcessor {
     _intervals.clear();
     _lastPositivePeak = null;
     _lastNegativePeak = null;
-    _lastTimestamp = null;
-    _previousRaw = null;
+    _lastRawSample = null;
+    _gridStartTimestamp = null;
+    _nextGridIndex = 1;
+    _previousGridRaw = null;
     _highPass = 0;
     _lowPass = 0;
     _bpm = null;
@@ -296,6 +349,13 @@ class _SignalSample {
   final DateTime timestamp;
   final double raw;
   final double filtered;
+}
+
+class _RawGreenSample {
+  const _RawGreenSample(this.timestamp, this.value);
+
+  final DateTime timestamp;
+  final double value;
 }
 
 class _FrameColor {

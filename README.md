@@ -22,13 +22,15 @@ PPG signal. It requests camera permission, locks focus and exposure, and streams
 low-resolution frames as YUV420 on Android or BGRA8888 on iOS. Keep the lens
 uncovered for the one-second ambient calibration. When a finger is detected,
 fully cover the lens and flashlight and hold still. Stable coverage is required
-before pulse processing starts; the BPM stays blank until three consistent,
-plausible pulse intervals are found. A 0.75–3.5 Hz IIR bandpass approximation,
-peak prominence and interval checks reject baseline drift and placement changes.
+before pulse processing starts; the BPM stays blank until three plausible
+pulse intervals are found. Raw green samples are linearly interpolated onto a
+fixed 30 Hz grid before a time-invariant 0.75–3.5 Hz IIR bandpass. Relative
+AC/DC peak prominence and interval checks reject low-quality signals, baseline
+drift, and placement changes.
 The measurement screen displays a filtered waveform, signal quality, and a
 10-second progress indicator. The indicator reaches 100% after ten seconds but
-does not automatically stop the scan; removing the finger for 300 ms ends the
-session.
+does not automatically stop the scan; three consecutive uncovered frames start
+a 300 ms removal confirmation before ending the session.
 Each session appends accepted raw green-channel samples and logger diagnostics to
 `data/heart_rate_samples.csv` under the app's writable storage directory (the
 application documents directory on Android/iOS, or the executable directory
@@ -90,16 +92,20 @@ Frame metrics received
 |
 +-- Finger detected? (skin-tone ratio >= 0.15 AND mean luma >= 12)
 |   +-- No
-|   |   +-- Currently ACTIVE? -> Start/continue removal timer
-|   |   |   +-- Not removed for 300 ms yet -> Stay ACTIVE
-|   |   |   +-- Removed for at least 300 ms -> RELEASED
+|   |   +-- Currently ACTIVE? -> Increment consecutive failure count
+|   |   |   +-- Fewer than 3 failed frames -> Stay ACTIVE; retain history
+|   |   |   +-- At least 3 -> Start/continue removal timer
+|   |   |       +-- Less than 300 ms -> Stay ACTIVE; retain history
+|   |   |       +-- At least 300 ms -> RELEASED
 |   |   +-- Not ACTIVE -> Clear coverage timer; IDLE
 |   +-- Yes
 |       +-- Currently ACTIVE?
-|       |   +-- Looks covered? -> Clear removal timer; stay ACTIVE
-|       |   +-- Does not look covered? -> Start/continue removal timer
-|       |       +-- Less than 300 ms -> Stay ACTIVE
-|       |       +-- At least 300 ms -> RELEASED
+|       |   +-- Looks covered? -> Clear failure count and removal timer
+|       |   +-- Does not look covered? -> Increment consecutive failure count
+|       |       +-- Fewer than 3 failed frames -> Stay ACTIVE; retain history
+|       |       +-- At least 3 -> Start/continue removal timer
+|       |           +-- Less than 300 ms -> Stay ACTIVE; retain history
+|       |           +-- At least 300 ms -> RELEASED
 |       +-- Not ACTIVE -> Set state to DETECTING
 |           +-- Looks covered?
 |               +-- No -> Clear confirmation timer; stay DETECTING
@@ -122,31 +128,38 @@ The calibration timer starts with the first received frame. The implementation
 does not independently check that calibration frames are truly uncovered or
 that the baseline is sufficiently stable. The color and brightness thresholds
 are heuristics and may behave differently across cameras, skin tones, and
-lighting.
+lighting. Active coverage failures are debounced by three consecutive frames
+before the existing 300 ms release confirmation begins, so one- or two-frame
+gaps do not clear the processor's rolling history or restart progress.
 
 ### BPM signal processing and decision tree
 
 Only frames whose presence state is `ACTIVE` enter the pulse processor and CSV
-sample callback. The processor filters the mean-green sample using a two-stage,
-first-order IIR approximation to a 0.75–3.5 Hz bandpass:
+sample callback. Before filtering, the processor linearly interpolates the
+timestamped raw green stream onto a uniform 30 Hz grid. Grid timestamps are
+anchored at the first sample and spaced by 1/30 second (rounded to microseconds);
+interpolation uses each adjacent pair of camera samples. The IIR therefore
+always receives samples at the same rate even when camera frame delivery jitters
+or skips a frame. Its coefficients are fixed:
 
 ```text
-dt = clamp(time since previous sample, 1/120 s, 1/5 s)
-    (first sample uses 1/30 s)
+sample rate = 30 Hz
+dt = 1/30 s
 
 high-pass cutoff = 0.75 Hz
 RC_HP = 1 / (2 pi * 0.75)
-alpha_HP = RC_HP / (RC_HP + dt)
+alpha_HP = RC_HP / (RC_HP + 1/30)
 high = alpha_HP * (previous high + current G - previous G)
 
 low-pass cutoff = 3.5 Hz
 RC_LP = 1 / (2 pi * 3.5)
-alpha_LP = dt / (RC_LP + dt)
+alpha_LP = (1/30) / (RC_LP + 1/30)
 filtered = previous filtered + alpha_LP * (high - previous filtered)
 ```
 
-The processor keeps up to 15 seconds of filtered history. Peak detection then
-uses the latest three samples and branches as follows:
+This is a time-invariant two-stage first-order IIR approximation; frame-to-frame
+`dt` never changes its poles. The processor keeps up to 15 seconds of resampled
+history. Peak detection uses the latest three samples and a local window:
 
 ```text
 New filtered sample
@@ -158,7 +171,9 @@ New filtered sample
 |       +-- Fewer than 3 local samples? -> No peak
 |       +-- For a maximum: prominence = peak - local minimum
 |       +-- For a minimum: prominence = local maximum - peak
-|       +-- Require prominence >= max(0.08, 18% of local signal range)
+|       +-- Calculate local DC as mean raw green in the same 500 ms window
+|       +-- Require prominence / local DC >=
+|           max(0.1%, 18% of local signal range / local DC)
 |           +-- No -> Reject this peak
 |           +-- Yes -> Compare with previous peak of the same kind
 |               (maxima with maxima, minima with minima)
@@ -166,8 +181,10 @@ New filtered sample
 |               +-- Interval < 285 ms -> Ignore interval
 |               +-- Interval > 1350 ms
 |               |   -> Clear accepted intervals and BPM; reject interval
-|               +-- Interval differs from median accepted interval by >25%
-|               |   -> Reject interval
+|               +-- First interval -> Accept unconditionally
+|               +-- Second interval differs from first by >35% -> Reject
+|               +-- Fewer than 3 accepted intervals available -> Bootstrap
+|               +-- Otherwise, deviation from median >25% -> Reject interval
 |               +-- Otherwise -> Accept interval; keep at most 5 intervals
 |                   +-- Fewer than 3 accepted intervals? -> BPM stays unset
 |                   +-- At least 3 -> BPM = round(60,000,000 / mean interval us)
@@ -177,32 +194,37 @@ New filtered sample
 
 An interval is the time between two successive maxima **or** two successive
 minima. Each prominence-qualified extremum becomes the reference for the next
-interval check, including when its interval is rejected. Once at least three
-intervals are accepted, BPM is calculated from the mean of the currently
-retained (up to five) intervals. A rejected interval does not directly replace
-the displayed BPM, except that an interval longer than 1350 ms clears it. A
-later accepted interval resets the rejected-interval counter. Consequently, the
-last accepted BPM can remain visible while newer intervals are rejected; the
-quality label is calculated separately and does not mark the BPM as stale.
+interval check, including when its interval is rejected. The first interval is
+stored without a median check, so an empty rolling buffer cannot reject its own
+bootstrap sample. The second interval is compared only to the first, with 35%
+tolerance. The third interval fills the initial set; once three intervals have
+been accepted, subsequent intervals must be within 25% of the median of the
+retained intervals. BPM remains unset until three intervals are accepted and is
+then calculated from the mean of up to five accepted intervals. A rejected
+interval does not directly replace the displayed BPM, except that an interval
+longer than 1350 ms clears it. A later accepted interval resets the
+rejected-interval counter. Consequently, the last accepted BPM can remain
+visible while newer intervals are rejected; the quality label is calculated
+separately and does not mark the BPM as stale.
 
 The signal-quality label is a separate heuristic over the latest up to 90
-filtered samples:
+resampled points (up to three seconds). It measures filtered AC peak-to-peak
+amplitude against mean raw-green DC in that same window:
 
 ```text
-Fewer than 30 samples -> ACQUIRING
-Otherwise calculate amplitude = max(filtered) - min(filtered)
-+-- Amplitude < 0.08 -> POOR
-+-- At least 3 accepted intervals and no outstanding rejected interval
-|   -> GOOD
-+-- Amplitude > 0.3 -> FAIR
-+-- Otherwise -> POOR
+Fewer than 30 points -> ACQUIRING
+Otherwise AC/DC = (max(filtered) - min(filtered)) / mean(raw green)
++-- AC/DC < 0.2% -> POOR
++-- At least 3 accepted intervals, no outstanding rejection,
+|   and AC/DC >= 1% -> GOOD
++-- Otherwise, if AC/DC >= 0.2% -> FAIR
 ```
 
-The 90-sample window is a sample count, not a fixed time span. `GOOD` is not a
-guarantee that the signal is physiologically valid; periodic movement or other
-optical artifacts can also be periodic. This is why the result should not be
-used for diagnosis or urgent medical decisions. The `0.08` and `0.3` amplitude
-thresholds are in filtered signal units, not BPM units.
+`GOOD` is not a guarantee that the signal is physiologically valid; periodic
+movement or other optical artifacts can also be periodic. This is why the result
+should not be used for diagnosis or urgent medical decisions. Ratio thresholds
+reduce sensitivity to sensor gain and torch intensity; they do not eliminate
+all device-, placement-, or skin-dependent variation.
 
 ### App and session control-flow tree
 
@@ -235,6 +257,9 @@ Launch app
                         |   -> Filter green sample; update BPM, quality,
                         |      progress and waveform; append raw sample and
                         |      logger diagnostics to CSV
+                        +-- Active coverage has fewer than 3 consecutive
+                        |   failed frames or has failed for less than 300 ms
+                        |   -> Remain ACTIVE; preserve history and progress
                         +-- Presence becomes/remains RELEASED
                             -> Clear home BPM; wait 600 ms; close screen
         |

@@ -19,6 +19,7 @@ class OpticalPresenceGate {
   static const confirmationDuration = Duration(milliseconds: 450);
   static const releaseDuration = Duration(milliseconds: 300);
   static const minimumCalibrationFrames = 8;
+  static const releaseDebounceFrames = 3;
 
   final List<OpticalFrameMetrics> _calibrationFrames = [];
   DateTime? _calibrationStartedAt;
@@ -26,6 +27,7 @@ class OpticalPresenceGate {
   DateTime? _releaseStartedAt;
   double? _baselineMeanLuma;
   double? _baselineVariance;
+  int _consecutiveCoverageFailures = 0;
 
   PresenceState state = PresenceState.idle;
   bool get isCalibrated => _baselineMeanLuma != null;
@@ -53,11 +55,16 @@ class OpticalPresenceGate {
     final fingerDetected = frame.skinToneRatio >= 0.15 && frame.meanLuma >= 12;
     final covered = _looksCovered(frame);
     if (state == PresenceState.active) {
-      if (covered) {
+      if (fingerDetected && covered) {
+        _consecutiveCoverageFailures = 0;
         _releaseStartedAt = null;
       } else {
-        _releaseStartedAt ??= timestamp;
-        if (timestamp.difference(_releaseStartedAt!) >= releaseDuration) {
+        _consecutiveCoverageFailures++;
+        if (_consecutiveCoverageFailures >= releaseDebounceFrames) {
+          _releaseStartedAt ??= timestamp;
+        }
+        if (_releaseStartedAt != null &&
+            timestamp.difference(_releaseStartedAt!) >= releaseDuration) {
           state = PresenceState.released;
         }
       }
@@ -66,6 +73,7 @@ class OpticalPresenceGate {
 
     if (!fingerDetected) {
       _candidateStartedAt = null;
+      _consecutiveCoverageFailures = 0;
       state = PresenceState.idle;
       return state;
     }
@@ -73,6 +81,7 @@ class OpticalPresenceGate {
     state = PresenceState.detecting;
     if (!covered) {
       _candidateStartedAt = null;
+      _consecutiveCoverageFailures = 0;
       return state;
     }
 
@@ -80,6 +89,7 @@ class OpticalPresenceGate {
     if (timestamp.difference(_candidateStartedAt!) >= confirmationDuration) {
       state = PresenceState.active;
       _releaseStartedAt = null;
+      _consecutiveCoverageFailures = 0;
     }
     return state;
   }

@@ -41,6 +41,30 @@ void main() {
     expect(processor.waveform, isNotEmpty);
   });
 
+  test('resampling and AC/DC normalization tolerate jitter and sensor gain',
+      () {
+    final start = DateTime(2026, 1, 1);
+    final jitterMilliseconds = [0, 7, -5, 3];
+
+    for (final baseline in [40.0, 200.0]) {
+      final processor = PpgProcessor();
+      PpgUpdate? update;
+      for (var frame = 0; frame < 450; frame++) {
+        final elapsed = frame / 30 +
+            jitterMilliseconds[frame % jitterMilliseconds.length] / 1000;
+        final timestamp = start.add(
+          Duration(microseconds: (elapsed * 1000000).round()),
+        );
+        final pulse =
+            baseline + baseline * 0.003 * math.sin(2 * math.pi * 1.2 * elapsed);
+        update = processor.addGreenSample(pulse, timestamp);
+      }
+
+      expect(update?.bpm, inInclusiveRange(68, 76));
+      expect(update?.signalQuality, PpgSignalQuality.fair);
+    }
+  });
+
   test('does not treat a finger-placement step as a pulse', () {
     final processor = PpgProcessor();
     final start = DateTime(2026, 1, 1);

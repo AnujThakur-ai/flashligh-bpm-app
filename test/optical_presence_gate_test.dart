@@ -142,7 +142,7 @@ void main() {
       );
     });
 
-    test('terminates after sustained removal and does not reactivate', () {
+    test('debounces coverage failures before terminating the session', () {
       final gate = OpticalPresenceGate();
       final start = DateTime(2026, 1, 1);
       const ambient = OpticalFrameMetrics(
@@ -168,7 +168,27 @@ void main() {
         PresenceState.active,
       );
       expect(
+        gate.process(covered, start.add(const Duration(milliseconds: 1650))),
+        PresenceState.active,
+      );
+      expect(
+        gate.process(ambient, start.add(const Duration(milliseconds: 1700))),
+        PresenceState.active,
+      );
+      expect(
+        gate.process(ambient, start.add(const Duration(milliseconds: 1800))),
+        PresenceState.active,
+      );
+      expect(
         gate.process(ambient, start.add(const Duration(milliseconds: 1900))),
+        PresenceState.active,
+      );
+      expect(
+        gate.process(ambient, start.add(const Duration(milliseconds: 2199))),
+        PresenceState.active,
+      );
+      expect(
+        gate.process(ambient, start.add(const Duration(milliseconds: 2200))),
         PresenceState.released,
       );
       expect(
