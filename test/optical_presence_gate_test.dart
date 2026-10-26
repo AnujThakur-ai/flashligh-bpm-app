@@ -63,7 +63,7 @@ void main() {
       );
     });
 
-    test('resets detection when coverage is not continuous', () {
+    test('resets detection after three consecutive coverage failures', () {
       final gate = OpticalPresenceGate();
       final start = DateTime(2026, 1, 1);
       const ambient = OpticalFrameMetrics(
@@ -88,14 +88,61 @@ void main() {
       );
       expect(
         gate.process(ambient, start.add(const Duration(milliseconds: 1300))),
-        PresenceState.idle,
-      );
-      expect(
-        gate.process(covered, start.add(const Duration(milliseconds: 1400))),
         PresenceState.detecting,
       );
       expect(
-        gate.process(covered, start.add(const Duration(milliseconds: 1850))),
+        gate.process(ambient, start.add(const Duration(milliseconds: 1370))),
+        PresenceState.detecting,
+      );
+      expect(
+        gate.process(ambient, start.add(const Duration(milliseconds: 1440))),
+        PresenceState.idle,
+      );
+      expect(
+        gate.process(covered, start.add(const Duration(milliseconds: 1500))),
+        PresenceState.detecting,
+      );
+      expect(
+        gate.process(covered, start.add(const Duration(milliseconds: 1950))),
+        PresenceState.active,
+      );
+    });
+
+    test('keeps confirmation timer through two transient coverage failures',
+        () {
+      final gate = OpticalPresenceGate();
+      final start = DateTime(2026, 1, 1);
+      const ambient = OpticalFrameMetrics(
+        meanLuma: 100,
+        meanRed: 100,
+        lumaVariance: 400,
+        skinToneRatio: 0.05,
+      );
+      const covered = OpticalFrameMetrics(
+        meanLuma: 65,
+        meanRed: 65,
+        lumaVariance: 100,
+        skinToneRatio: 0.8,
+      );
+      for (var frame = 0; frame < 16; frame++) {
+        gate.process(ambient, start.add(Duration(milliseconds: frame * 70)));
+      }
+
+      gate.process(covered, start.add(const Duration(milliseconds: 1120)));
+      expect(
+        gate.process(ambient, start.add(const Duration(milliseconds: 1200))),
+        PresenceState.detecting,
+      );
+      expect(
+        gate.process(ambient, start.add(const Duration(milliseconds: 1280))),
+        PresenceState.detecting,
+      );
+      expect(
+        gate.process(covered, start.add(const Duration(milliseconds: 1300))),
+        PresenceState.detecting,
+      );
+      expect(
+        gate.process(covered, start.add(const Duration(milliseconds: 1570))),
         PresenceState.active,
       );
     });

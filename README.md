@@ -35,8 +35,9 @@ Each session appends accepted raw green-channel samples and logger diagnostics t
 `data/heart_rate_samples.csv` under the app's writable storage directory (the
 application documents directory on Android/iOS, or the executable directory
 on desktop). Frames that fail presence validation are excluded from both BPM
-calculation and CSV logging. The Start Measurement button opens a dedicated
-camera screen with the live BPM meter overlaid on the preview.
+calculation and CSV logging. The logger creates the `data/` parent directory
+recursively before opening the CSV file. The Start Measurement button opens a
+dedicated camera screen with the live BPM meter overlaid on the preview.
 
 ## How the measurement works
 
@@ -65,7 +66,7 @@ stride is chosen to sample at most about 40 positions per ROI dimension.
   luma (`mean Y`), average red, luma variance
   `mean(Y²) - mean(Y)²` (clamped to at least zero), and the skin-tone ratio.
   A pixel contributes to the skin-tone count when
-  `Y >= 20`, `70 <= U <= 150`, and `120 <= V <= 195`; the ratio is
+  `Y >= 20`, `70 <= U <= 150`, and `120 <= V <= 240`; the ratio is
   `skin-tone pixel count / sampled pixel count`.
 
 The frame's **mean green** is the raw PPG sample. Red and the skin-tone ratio
@@ -90,30 +91,31 @@ Frame metrics received
 |   |                         averages of all collected frames; remain IDLE
 |   +-- No -> Evaluate finger and coverage
 |
-+-- Finger detected? (skin-tone ratio >= 0.15 AND mean luma >= 12)
-|   +-- No
-|   |   +-- Currently ACTIVE? -> Increment consecutive failure count
-|   |   |   +-- Fewer than 3 failed frames -> Stay ACTIVE; retain history
-|   |   |   +-- At least 3 -> Start/continue removal timer
-|   |   |       +-- Less than 300 ms -> Stay ACTIVE; retain history
-|   |   |       +-- At least 300 ms -> RELEASED
-|   |   +-- Not ACTIVE -> Clear coverage timer; IDLE
-|   +-- Yes
-|       +-- Currently ACTIVE?
-|       |   +-- Looks covered? -> Clear failure count and removal timer
-|       |   +-- Does not look covered? -> Increment consecutive failure count
-|       |       +-- Fewer than 3 failed frames -> Stay ACTIVE; retain history
-|       |       +-- At least 3 -> Start/continue removal timer
-|       |           +-- Less than 300 ms -> Stay ACTIVE; retain history
-|       |           +-- At least 300 ms -> RELEASED
-|       +-- Not ACTIVE -> Set state to DETECTING
-|           +-- Looks covered?
-|               +-- No -> Clear confirmation timer; stay DETECTING
-|               +-- Yes -> Start/continue coverage confirmation timer
-|                   +-- Covered continuously for less than 450 ms
-|                   |   -> Stay DETECTING
-|                   +-- Covered continuously for at least 450 ms
-|                       -> ACTIVE; begin pulse processing
++-- State is ACTIVE?
+|   +-- Finger detected AND looks covered?
+|       +-- Yes -> Clear failure count and removal timer; stay ACTIVE
+|       +-- No -> Increment consecutive coverage-failure count
+|           +-- Fewer than 3 failed frames -> Stay ACTIVE; retain history
+|           +-- At least 3 -> Start/continue removal timer
+|               +-- Less than 300 ms -> Stay ACTIVE; retain history
+|               +-- At least 300 ms -> RELEASED
+|
++-- State is DETECTING?
+|   +-- Finger detected AND looks covered?
+|       +-- Yes -> Clear failure count; continue/start confirmation timer
+|           +-- Less than 450 ms elapsed -> Stay DETECTING
+|           +-- At least 450 ms elapsed -> ACTIVE; begin pulse processing
+|       +-- No -> Increment consecutive coverage-failure count
+|           +-- Fewer than 3 failed frames -> Keep confirmation timer
+|           +-- At least 3 -> Clear confirmation timer and failure count
+|               +-- Finger still detected -> Stay DETECTING
+|               +-- Finger not detected -> IDLE
+|
++-- State is IDLE?
+    +-- Finger not detected -> Stay IDLE
+    +-- Finger detected -> Set state to DETECTING
+        +-- Looks covered? -> Start confirmation timer
+        +-- Not covered? -> Wait for full coverage
 |
 +-- Looks covered means ALL of:
     +-- Skin-tone ratio >= 0.55
@@ -128,9 +130,12 @@ The calibration timer starts with the first received frame. The implementation
 does not independently check that calibration frames are truly uncovered or
 that the baseline is sufficiently stable. The color and brightness thresholds
 are heuristics and may behave differently across cameras, skin tones, and
-lighting. Active coverage failures are debounced by three consecutive frames
-before the existing 300 ms release confirmation begins, so one- or two-frame
-gaps do not clear the processor's rolling history or restart progress.
+lighting. Coverage failures in both DETECTING and ACTIVE are debounced for three
+consecutive frames. During DETECTING, one or two failed frames preserve the
+450 ms confirmation timer; the third clears it (and returns to IDLE if the
+finger is no longer detected). During ACTIVE, the third failed frame starts
+the existing 300 ms release confirmation, so transient gaps do not clear the
+processor's rolling history or restart progress.
 
 ### BPM signal processing and decision tree
 
@@ -140,7 +145,12 @@ timestamped raw green stream onto a uniform 30 Hz grid. Grid timestamps are
 anchored at the first sample and spaced by 1/30 second (rounded to microseconds);
 interpolation uses each adjacent pair of camera samples. The IIR therefore
 always receives samples at the same rate even when camera frame delivery jitters
-or skips a frame. Its coefficients are fixed:
+or skips a frame. If two consecutive raw camera frames are more than 100 ms
+apart, the processor treats this as a stream interruption: it discards the
+interpolation anchor, filter state, rolling waveform, accepted intervals, and
+BPM, then starts a new grid at the current sample. It does not interpolate
+across the gap. The active session's elapsed progress timer is retained. The
+filter coefficients are fixed:
 
 ```text
 sample rate = 30 Hz
@@ -251,6 +261,10 @@ Launch app
                         |   -> Skip frame
                         +-- Frame processing throws
                         |   -> Log error; show processing error
+                        +-- Consecutive raw-frame gap exceeds 100 ms
+                        |   -> Reset interpolation, filter, waveform, and BPM
+                        |      state; re-anchor at the current sample while
+                        |      preserving active-session progress
                         +-- Presence is IDLE or DETECTING
                         |   -> Clear pulse history/BPM; do not log sample
                         +-- Presence becomes ACTIVE

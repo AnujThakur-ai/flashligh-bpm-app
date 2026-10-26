@@ -31,7 +31,9 @@ class PpgCsvLogger {
     final dataDirectory = Directory(
       '${targetDirectory.path}${Platform.pathSeparator}data',
     );
-    await dataDirectory.create(recursive: true);
+    if (!await dataDirectory.exists()) {
+      await dataDirectory.create(recursive: true);
+    }
     final file = File(
       '${dataDirectory.path}${Platform.pathSeparator}heart_rate_samples.csv',
     );

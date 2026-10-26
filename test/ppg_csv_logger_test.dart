@@ -43,4 +43,18 @@ void main() {
     expect(lines.last, contains('"1700000000000","42","0.84","42.0","21.42"'));
     expect(lines.last, contains('"1","true","0","","0",""'));
   });
+
+  test('creates missing parent directories before opening the CSV file',
+      () async {
+    final nestedDirectory = Directory(
+      '${targetDirectory.path}${Platform.pathSeparator}nested'
+      '${Platform.pathSeparator}app',
+    );
+    expect(await nestedDirectory.exists(), isFalse);
+
+    final logger = await PpgCsvLogger.create(directory: nestedDirectory);
+
+    expect(await nestedDirectory.exists(), isTrue);
+    expect(await File(logger.filePath).exists(), isTrue);
+  });
 }

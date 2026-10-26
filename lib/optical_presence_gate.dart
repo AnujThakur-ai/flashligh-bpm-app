@@ -19,7 +19,7 @@ class OpticalPresenceGate {
   static const confirmationDuration = Duration(milliseconds: 450);
   static const releaseDuration = Duration(milliseconds: 300);
   static const minimumCalibrationFrames = 8;
-  static const releaseDebounceFrames = 3;
+  static const coverageFailureDebounceFrames = 3;
 
   final List<OpticalFrameMetrics> _calibrationFrames = [];
   DateTime? _calibrationStartedAt;
@@ -60,7 +60,7 @@ class OpticalPresenceGate {
         _releaseStartedAt = null;
       } else {
         _consecutiveCoverageFailures++;
-        if (_consecutiveCoverageFailures >= releaseDebounceFrames) {
+        if (_consecutiveCoverageFailures >= coverageFailureDebounceFrames) {
           _releaseStartedAt ??= timestamp;
         }
         if (_releaseStartedAt != null &&
@@ -71,18 +71,27 @@ class OpticalPresenceGate {
       return state;
     }
 
-    if (!fingerDetected) {
-      _candidateStartedAt = null;
+    if (state == PresenceState.detecting) {
+      if (!fingerDetected || !covered) {
+        _consecutiveCoverageFailures++;
+        if (_consecutiveCoverageFailures >= coverageFailureDebounceFrames) {
+          _candidateStartedAt = null;
+          _consecutiveCoverageFailures = 0;
+          if (!fingerDetected) state = PresenceState.idle;
+        }
+        return state;
+      }
       _consecutiveCoverageFailures = 0;
-      state = PresenceState.idle;
-      return state;
-    }
+    } else {
+      if (!fingerDetected) {
+        _candidateStartedAt = null;
+        _consecutiveCoverageFailures = 0;
+        state = PresenceState.idle;
+        return state;
+      }
 
-    state = PresenceState.detecting;
-    if (!covered) {
-      _candidateStartedAt = null;
-      _consecutiveCoverageFailures = 0;
-      return state;
+      state = PresenceState.detecting;
+      if (!covered) return state;
     }
 
     _candidateStartedAt ??= timestamp;

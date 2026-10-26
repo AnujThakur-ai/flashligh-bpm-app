@@ -65,6 +65,28 @@ void main() {
     }
   });
 
+  test('resets filter and rolling history after a long raw-frame gap', () {
+    final processor = PpgProcessor();
+    final start = DateTime(2026, 1, 1);
+
+    for (var frame = 0; frame < 20; frame++) {
+      processor.addGreenSample(
+        100,
+        start.add(Duration(milliseconds: frame * 33)),
+      );
+    }
+
+    final afterGap = processor.addGreenSample(
+      220,
+      start.add(const Duration(seconds: 1)),
+    );
+
+    expect(processor.waveform, [0]);
+    expect(afterGap.filtered, 0);
+    expect(afterGap.bpm, isNull);
+    expect(afterGap.progress, closeTo(0.1, 0.01));
+  });
+
   test('does not treat a finger-placement step as a pulse', () {
     final processor = PpgProcessor();
     final start = DateTime(2026, 1, 1);

@@ -30,6 +30,7 @@ class PpgProcessor {
   static const _historyDuration = Duration(seconds: 15);
   static const _sampleRateHz = 30;
   static const _samplePeriodSeconds = 1 / _sampleRateHz;
+  static const _maximumRawFrameGap = Duration(milliseconds: 100);
   static const _baselineCutoffHz = 0.75;
   static const _smoothingCutoffHz = 3.5;
   static const _minimumAcDcRatio = 0.001;
@@ -84,12 +85,9 @@ class PpgProcessor {
 
   PpgUpdate addGreenSample(double green, DateTime timestamp) {
     _activeStartedAt ??= timestamp;
-    final previous = _lastRawSample;
+    var previous = _lastRawSample;
     var bpm = _bpm;
-    if (previous == null) {
-      _gridStartTimestamp = timestamp;
-      _filterAtGrid(green, timestamp);
-    } else {
+    if (previous != null) {
       if (!timestamp.isAfter(previous.timestamp)) {
         throw ArgumentError.value(
           timestamp,
@@ -97,6 +95,17 @@ class PpgProcessor {
           'Sample timestamps must be strictly increasing.',
         );
       }
+      if (timestamp.difference(previous.timestamp) > _maximumRawFrameGap) {
+        _resetPulseSignal();
+        previous = null;
+        bpm = null;
+      }
+    }
+
+    if (previous == null) {
+      _gridStartTimestamp = timestamp;
+      _filterAtGrid(green, timestamp);
+    } else {
       while (true) {
         final gridTimestamp = _gridTimestamp(_nextGridIndex);
         if (gridTimestamp.isAfter(timestamp)) break;
@@ -385,7 +394,7 @@ class _ColorAccumulator {
     _redTotal += red;
     _lumaTotal += luma;
     _lumaSquaredTotal += luma * luma;
-    if (luma >= 20 && u >= 70 && u <= 150 && v >= 120 && v <= 195) {
+    if (luma >= 20 && u >= 70 && u <= 150 && v >= 120 && v <= 240) {
       _skinCount++;
     }
   }
